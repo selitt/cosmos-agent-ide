@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import socket
+import ssl
 from pathlib import Path
 import subprocess
 import sys
@@ -120,9 +122,41 @@ class WorkspaceTests(unittest.TestCase):
 
 
 class GeminiTests(unittest.TestCase):
+    def tearDown(self):
+        server.gemini_ssl_context.cache_clear()
+
+    def test_macos_roots_loaded_without_disabling_tls(self):
+        context = ssl.create_default_context()
+        with patch('server.ssl.create_default_context', return_value=context), patch('server.sys.platform', 'darwin'), patch.dict(os.environ, {}, clear=True), patch('server.subprocess.run', return_value=subprocess.CompletedProcess([], 0, stdout='PUBLIC_CERTS')) as export, patch.object(context, 'load_verify_locations') as load:
+            server.gemini_ssl_context.cache_clear()
+            self.assertIs(server.gemini_ssl_context(), context)
+            self.assertIs(server.gemini_ssl_context(), context)
+        load.assert_called_once_with(cadata='PUBLIC_CERTS')
+        export.assert_called_once()
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    def test_explicit_ca_file_not_overridden(self):
+        with patch('server.ssl.create_default_context') as create, patch('server.sys.platform', 'darwin'), patch.dict(os.environ, {'SSL_CERT_FILE': '/trusted/custom.pem'}), patch('server.subprocess.run') as export:
+            server.gemini_ssl_context.cache_clear()
+            self.assertIs(server.gemini_ssl_context(), create.return_value)
+            export.assert_not_called()
+
+    def test_specific_network_errors_do_not_echo_secrets(self):
+        errors = [(ssl.SSLCertVerificationError(1, 'SECRET_KEY'), 'сертификат'),
+                  (socket.gaierror(-2, 'SECRET_KEY'), 'DNS'),
+                  (TimeoutError('SECRET_KEY'), 'ожидания'),
+                  (ConnectionRefusedError('SECRET_KEY'), 'отклонено')]
+        for reason, expected in errors:
+            with self.subTest(reason=type(reason).__name__), patch('server.gemini_ssl_context'), patch('urllib.request.urlopen', side_effect=urllib.error.URLError(reason)):
+                with self.assertRaises(ValueError) as raised:
+                    server.gemini_request('SECRET_KEY', 'gemini-3.8-flash', [])
+                self.assertIn(expected, str(raised.exception))
+                self.assertNotIn('SECRET_KEY', str(raised.exception))
+
     def test_request_format_and_response(self):
         result = {'candidates': [{'content': {'parts': [{'text': 'hidden', 'thought': True}, {'text': 'GEMINI_OK'}]}}]}
-        with patch('urllib.request.urlopen', return_value=io.BytesIO(json.dumps(result).encode())) as opened:
+        with patch('server.gemini_ssl_context'), patch('urllib.request.urlopen', return_value=io.BytesIO(json.dumps(result).encode())) as opened:
             self.assertEqual(server.gemini_request('TEST_KEY', 'gemini-3.8-flash', [{'role':'user','content':'Hi'}]), 'GEMINI_OK')
         request = opened.call_args.args[0]
         self.assertNotIn('TEST_KEY', request.full_url)
@@ -131,7 +165,7 @@ class GeminiTests(unittest.TestCase):
 
     def test_error_never_echoes_key(self):
         error = urllib.error.HTTPError('url', 403, 'SECRET_KEY', {}, io.BytesIO(b'SECRET_KEY'))
-        with patch('urllib.request.urlopen', side_effect=error):
+        with patch('server.gemini_ssl_context'), patch('urllib.request.urlopen', side_effect=error):
             with self.assertRaises(ValueError) as raised:
                 server.gemini_request('SECRET_KEY', 'gemini-3.8-flash', [])
         self.assertNotIn('SECRET_KEY', str(raised.exception))
