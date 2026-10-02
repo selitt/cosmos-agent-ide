@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -10,6 +11,8 @@ from pathlib import Path
 import secrets
 import shutil
 import signal
+import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -51,6 +54,40 @@ def find_codex() -> str | None:
     return None
 
 
+@lru_cache(maxsize=1)
+def gemini_ssl_context() -> ssl.SSLContext:
+    """Keep TLS verification enabled, including with python.org's empty CA store."""
+    context = ssl.create_default_context()
+    if sys.platform == "darwin" and not os.environ.get("SSL_CERT_FILE"):
+        try:
+            roots = subprocess.run(
+                ["/usr/bin/security", "find-certificate", "-a", "-p",
+                 "/System/Library/Keychains/SystemRootCertificates.keychain"],
+                capture_output=True, text=True, check=True, timeout=10,
+            ).stdout
+            context.load_verify_locations(cadata=roots)
+        except (OSError, subprocess.SubprocessError, ssl.SSLError, ValueError):
+            if not context.get_ca_certs():
+                raise ValueError("Не удалось загрузить доверенные сертификаты macOS. "
+                                 "Проверьте установку Python или задайте SSL_CERT_FILE с доверенным CA-файлом.") from None
+    return context
+
+
+def gemini_network_error(reason: object) -> str:
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return ("Gemini: не удалось проверить сертификат HTTPS. "
+                "Проверьте системную дату, доверенные сертификаты и настройки HTTPS-прокси.")
+    if isinstance(reason, socket.gaierror):
+        return "Gemini: DNS не смог найти generativelanguage.googleapis.com. Проверьте сеть, DNS и VPN."
+    if isinstance(reason, TimeoutError):
+        return "Gemini: время ожидания ответа истекло. Проверьте сеть и повторите запрос."
+    if isinstance(reason, ConnectionRefusedError):
+        return "Gemini: соединение отклонено. Проверьте настройки прокси и доступ к Google API."
+    if isinstance(reason, ssl.SSLError):
+        return "Gemini: ошибка TLS-соединения. Проверьте HTTPS-прокси и доверенные сертификаты."
+    return "Gemini: сетевое соединение не установлено. Проверьте доступ к Google API, VPN и прокси."
+
+
 def gemini_request(key: str, model: str, messages: list[dict]) -> str:
     if not key.strip():
         raise ValueError("Введите Gemini API key в настройках")
@@ -65,7 +102,7 @@ def gemini_request(key: str, model: str, messages: list[dict]) -> str:
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", "x-goog-api-key": key}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with urllib.request.urlopen(request, timeout=90, context=gemini_ssl_context()) as response:
             payload = json.load(response)
     except urllib.error.HTTPError as exc:
         # Do not reflect a remote error body: it may echo credentials.
@@ -73,8 +110,10 @@ def gemini_request(key: str, model: str, messages: list[dict]) -> str:
                  403: "Нет доступа к модели или региону", 404: "Модель не найдена",
                  429: "Лимит запросов или квота исчерпаны"}
         raise ValueError(f"Gemini HTTP {exc.code}: {hints.get(exc.code, 'Ошибка сервиса; повторите позже')}") from None
-    except (urllib.error.URLError, TimeoutError):
-        raise ValueError("Не удалось связаться с Gemini. Проверьте сеть и повторите запрос.") from None
+    except urllib.error.URLError as exc:
+        raise ValueError(gemini_network_error(exc.reason)) from None
+    except (TimeoutError, ssl.SSLError) as exc:
+        raise ValueError(gemini_network_error(exc)) from None
     candidate = next(iter(payload.get("candidates", [])), {})
     text = "\n".join(p.get("text", "") for p in candidate.get("content", {}).get("parts", []) if not p.get("thought"))
     if not text:
