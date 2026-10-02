@@ -14,8 +14,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>Cosmos Agent IDE</string>
 <key>CFBundleDisplayName</key><string>Cosmos Agent IDE</string>
 <key>CFBundleIdentifier</key><string>dev.cosmos.agentide</string>
-<key>CFBundleVersion</key><string>1</string>
-<key>CFBundleShortVersionString</key><string>0.1.0</string>
+<key>CFBundleVersion</key><string>2</string>
+<key>CFBundleShortVersionString</key><string>0.1.1</string>
 <key>CFBundleExecutable</key><string>Cosmos</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSMinimumSystemVersion</key><string>12.0</string>
