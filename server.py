@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
 import hashlib
 import json
 import os
@@ -11,15 +10,13 @@ from pathlib import Path
 import secrets
 import shutil
 import signal
-import socket
-import ssl
+import shlex
+import tempfile
 import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -54,71 +51,12 @@ def find_codex() -> str | None:
     return None
 
 
-@lru_cache(maxsize=1)
-def gemini_ssl_context() -> ssl.SSLContext:
-    """Keep TLS verification enabled, including with python.org's empty CA store."""
-    context = ssl.create_default_context()
-    if sys.platform == "darwin" and not os.environ.get("SSL_CERT_FILE"):
-        try:
-            roots = subprocess.run(
-                ["/usr/bin/security", "find-certificate", "-a", "-p",
-                 "/System/Library/Keychains/SystemRootCertificates.keychain"],
-                capture_output=True, text=True, check=True, timeout=10,
-            ).stdout
-            context.load_verify_locations(cadata=roots)
-        except (OSError, subprocess.SubprocessError, ssl.SSLError, ValueError):
-            if not context.get_ca_certs():
-                raise ValueError("Не удалось загрузить доверенные сертификаты macOS. "
-                                 "Проверьте установку Python или задайте SSL_CERT_FILE с доверенным CA-файлом.") from None
-    return context
-
-
-def gemini_network_error(reason: object) -> str:
-    if isinstance(reason, ssl.SSLCertVerificationError):
-        return ("Gemini: не удалось проверить сертификат HTTPS. "
-                "Проверьте системную дату, доверенные сертификаты и настройки HTTPS-прокси.")
-    if isinstance(reason, socket.gaierror):
-        return "Gemini: DNS не смог найти generativelanguage.googleapis.com. Проверьте сеть, DNS и VPN."
-    if isinstance(reason, TimeoutError):
-        return "Gemini: время ожидания ответа истекло. Проверьте сеть и повторите запрос."
-    if isinstance(reason, ConnectionRefusedError):
-        return "Gemini: соединение отклонено. Проверьте настройки прокси и доступ к Google API."
-    if isinstance(reason, ssl.SSLError):
-        return "Gemini: ошибка TLS-соединения. Проверьте HTTPS-прокси и доверенные сертификаты."
-    return "Gemini: сетевое соединение не установлено. Проверьте доступ к Google API, VPN и прокси."
-
-
-def gemini_request(key: str, model: str, messages: list[dict]) -> str:
-    if not key.strip():
-        raise ValueError("Введите Gemini API key в настройках")
-    model = model.removeprefix("models/")
-    if not model or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._" for c in model):
-        raise ValueError("Некорректное имя модели Gemini")
-    body = {"systemInstruction": {"parts": [{"text": SYSTEM}]}, "contents": [
-        {"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]}
-        for m in messages]}
-    request = urllib.request.Request(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", "x-goog-api-key": key}, method="POST")
-    try:
-        with urllib.request.urlopen(request, timeout=90, context=gemini_ssl_context()) as response:
-            payload = json.load(response)
-    except urllib.error.HTTPError as exc:
-        # Do not reflect a remote error body: it may echo credentials.
-        hints = {400: "Проверьте ключ, модель и запрос", 401: "Неверный API key",
-                 403: "Нет доступа к модели или региону", 404: "Модель не найдена",
-                 429: "Лимит запросов или квота исчерпаны"}
-        raise ValueError(f"Gemini HTTP {exc.code}: {hints.get(exc.code, 'Ошибка сервиса; повторите позже')}") from None
-    except urllib.error.URLError as exc:
-        raise ValueError(gemini_network_error(exc.reason)) from None
-    except (TimeoutError, ssl.SSLError) as exc:
-        raise ValueError(gemini_network_error(exc)) from None
-    candidate = next(iter(payload.get("candidates", [])), {})
-    text = "\n".join(p.get("text", "") for p in candidate.get("content", {}).get("parts", []) if not p.get("thought"))
-    if not text:
-        raise ValueError("Gemini не вернул текст: " + str(candidate.get("finishReason") or payload.get("promptFeedback", {}).get("blockReason", "пустой ответ")))
-    return text
+def find_gemini() -> str | None:
+    candidates = [os.environ.get("GEMINI_BINARY"), shutil.which("gemini"),
+                  "/usr/local/bin/gemini", "/opt/homebrew/bin/gemini",
+                  str(Path.home() / ".npm-global/bin/gemini")]
+    candidates += [str(p) for p in sorted((Path.home() / ".nvm/versions/node").glob("*/bin/gemini"), reverse=True)]
+    return next((c for c in candidates if c and Path(c).is_file() and os.access(c, os.X_OK)), None)
 
 
 class Job:
@@ -171,6 +109,7 @@ class Workspace:
         self.root = root.resolve()
         self.token = secrets.token_urlsafe(32)
         self.codex = find_codex()
+        self.gemini = find_gemini()
         self.python = str(self.root / ".venv/bin/python") if (self.root / ".venv/bin/python").exists() else sys.executable
         self.jobs = {}
         self.lock = threading.RLock()
@@ -224,8 +163,8 @@ class Workspace:
         if not task or len(task) > 80_000:
             raise ValueError("Введите задачу длиной до 80 000 символов")
         key = data.get("key", "") or os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
-        if any(n["provider"] == "gemini" for n in nodes) and not key:
-            raise ValueError("Для агентов Gemini добавьте API key в настройках")
+        if any(n["provider"] == "gemini" for n in nodes) and not self.gemini:
+            raise ValueError("Gemini CLI не найден. Выполните npm install -g @google/gemini-cli и перезапустите IDE.")
         if any(n["provider"] == "codex" for n in nodes) and not self.codex:
             raise ValueError("Codex CLI не найден")
 
@@ -256,7 +195,13 @@ class Workspace:
                               + "\nPropose changes as code blocks; do not modify workspace files in team mode.")
                     try:
                         if node["provider"] == "gemini":
-                            answer = gemini_request(key, node.get("model") or "gemini-3.8-flash", [{"role": "user", "content": prompt}])
+                            child_job = Job("agent")
+                            with job.lock:
+                                job.children.append(child_job)
+                            if job.cancelled.is_set():
+                                child_job.stop()
+                            self.gemini_process(child_job, prompt, node.get("model", ""), key)
+                            answer = child_job.answer.strip()
                         else:
                             child_job = Job("agent")
                             with job.lock:
@@ -334,11 +279,15 @@ class Workspace:
         threading.Thread(target=run, daemon=True).start()
         return {"id": job.id}
 
-    def process(self, job, args, prompt=None, codex=False):
+    def process(self, job, args, prompt=None, codex=False, gemini=False, key=""):
         env = os.environ.copy()
         # Credentials supplied for Gemini are never forwarded to Python scripts or Codex.
         env.pop("GEMINI_API_KEY", None)
         env.pop("GOOGLE_API_KEY", None)
+        if gemini:
+            env["PATH"] = str(Path(args[0]).parent) + os.pathsep + env.get("PATH", "")
+            if key:
+                env["GEMINI_API_KEY"] = key
         with job.lock:
             if job.cancelled.is_set():
                 return
@@ -351,6 +300,20 @@ class Workspace:
                 proc.stdin.write(prompt)
                 proc.stdin.close()
             for line in proc.stdout:
+                if gemini:
+                    if key:
+                        line = line.replace(key, "[ключ скрыт]")
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        job.append(line)
+                        continue
+                    if event.get("type") == "message" and event.get("role") == "assistant":
+                        with job.lock:
+                            job.answer += event.get("content", "")
+                    elif event.get("type") == "error" or (event.get("type") == "result" and event.get("status") == "error"):
+                        job.append(str(event.get("error") or event.get("message") or event) + "\n")
+                    continue
                 if not codex:
                     job.append(line)
                     continue
@@ -369,11 +332,32 @@ class Workspace:
                     job.append(item.get("command", "") + "\n" + item.get("aggregated_output", ""))
             job.code = proc.wait()
             if job.code and not job.cancelled.is_set():
-                raise ValueError(f"Процесс завершился с кодом {job.code}")
+                raise ValueError(("Gemini CLI: " + job.output[-3000:] + "\nВойдите через Настройки → Войти в Gemini через консоль.") if gemini else f"Процесс завершился с кодом {job.code}")
         finally:
             if proc.poll() is None:
                 job.stop()
             proc.stdout.close()
+
+    def gemini_process(self, job, prompt, model="", key=""):
+        args = [self.gemini, "--output-format", "stream-json", "--approval-mode", "plan", "-e", "none"]
+        if model.strip():
+            args += ["--model", model.strip()]
+        # The conversation travels through stdin, not the process list.
+        self.process(job, args + ["-p", "Ответь на запрос из stdin."], prompt, gemini=True, key=key)
+        if not job.answer.strip() and not job.cancelled.is_set():
+            raise ValueError(job.output[-3000:] or "Gemini CLI не вернул ответ. Войдите через консоль в настройках.")
+
+    def gemini_login(self):
+        self.gemini = find_gemini()
+        if not self.gemini:
+            raise ValueError("Сначала установите Gemini CLI: npm install -g @google/gemini-cli")
+        if sys.platform != "darwin":
+            raise ValueError("Запустите gemini в вашем терминале и войдите в Google.")
+        with tempfile.NamedTemporaryFile(mode="w", prefix="cosmos-gemini-login-", suffix=".command", delete=False) as script:
+            script.write("#!/bin/sh\nexport PATH=" + shlex.quote(str(Path(self.gemini).parent)) + ':"$PATH"\nexec ' + shlex.quote(self.gemini) + "\n")
+        os.chmod(script.name, 0o700)
+        subprocess.run(["/usr/bin/open", "-a", "Terminal", script.name], check=True, timeout=10)
+        return {"ok": True}
 
     def chat(self, data):
         provider = data["provider"]
@@ -385,15 +369,11 @@ class Workspace:
         if sum(len(m["content"]) for m in messages) > 150_000:
             raise ValueError("Контекст слишком большой. Начните новый чат или отключите вложение файла.")
         if provider == "gemini":
+            if not self.gemini:
+                raise ValueError("Gemini CLI не найден. Выполните npm install -g @google/gemini-cli и перезапустите IDE.")
             key = data.get("key", "") or os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
-            if not key:
-                raise ValueError("Добавьте Gemini API key в настройках")
-            def work(job):
-                answer = gemini_request(key, data.get("model", "gemini-3.8-flash"), messages)
-                if not job.cancelled.is_set():
-                    with job.lock:
-                        job.answer = answer
-            return self.launch("chat", work)
+            prompt = SYSTEM + "\n\nConversation:\n" + "\n\n".join(m["role"] + ":\n" + m["content"] for m in messages)
+            return self.launch("chat", lambda job: self.gemini_process(job, prompt, data.get("model", ""), key))
         if not self.codex:
             raise ValueError("Codex CLI не найден. Установите CLI и выполните codex login, затем перезапустите IDE.")
         args = [self.codex, "exec", "--json", "--color", "never", "--skip-git-repo-check",
@@ -440,7 +420,7 @@ def handler_for(ws):
             try:
                 if url.path == "/api/info":
                     result = {"root": str(ws.root), "name": ws.root.name, "python": ws.python, "codex": ws.codex,
-                              "geminiConfigured": bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))}
+                              "gemini": ws.gemini, "geminiConfigured": bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))}
                 elif url.path == "/api/tree":
                     result = ws.tree(query.get("path", [""])[0])
                 elif url.path == "/api/file":
@@ -479,6 +459,8 @@ def handler_for(ws):
                         raise ValueError("Выберите сохранённый Python-файл")
                     interpreter = data.get("python", ws.python).strip()
                     result = ws.launch("run", lambda job: ws.process(job, [interpreter, "-u", str(path)]))
+                elif self.path == "/api/gemini/login":
+                    result = ws.gemini_login()
                 elif self.path == "/api/chat":
                     result = ws.chat(data)
                 elif self.path == "/api/stop":
