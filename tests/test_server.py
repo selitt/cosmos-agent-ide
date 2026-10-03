@@ -22,7 +22,7 @@ class WorkspaceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name).resolve()
-        with patch('server.find_codex', return_value='fake-codex'), patch('server.find_gemini', return_value='fake-gemini'):
+        with patch('server.find_codex', return_value='fake-codex'), patch('server.find_gemini', return_value='fake-gemini'), patch('server.find_agy', return_value=None):
             self.ws = server.Workspace(self.root)
 
     def tearDown(self):
@@ -148,6 +148,20 @@ class GeminiTests(unittest.TestCase):
         self.assertEqual(job.status, 'done')
         self.assertNotIn('SECRET', job.output)
         self.assertIn('[ключ скрыт]', job.output)
+
+    def test_antigravity_console_protocol_and_final_response(self):
+        path=self.fake_cli("import sys,json,os\nassert 'plan' in sys.argv\nassert '--dangerously-skip-permissions' not in sys.argv\nassert 'gemini-3.8-flash-medium' in sys.argv\nassert 'GEMINI_API_KEY' not in os.environ\nm=json.loads(sys.stdin.readline())\nassert m['event']=='user'\nassert 'Привет' in m['message']['content']\nprint(json.dumps({'event':'step_update','step_update':{'step_type':'agent_response','text_delta':'partial'}}))\nprint(json.dumps({'event':'result','result':{'status':'SUCCESS','response':'AGY_OK'}}))\n")
+        self.ws.agy=str(path)
+        job=self.wait(self.ws.chat({'provider':'gemini','key':'SECRET','messages':[{'role':'user','content':'Привет'}]})['id'])
+        self.assertEqual(job.status,'done')
+        self.assertEqual(job.answer,'AGY_OK')
+
+    def test_antigravity_auth_failure_is_visible(self):
+        path=self.fake_cli("import sys,json\nsys.stdin.read()\nprint(json.dumps({'event':'result','result':{'status':'ERROR','error':'authentication required'}}))\nsys.exit(1)\n")
+        self.ws.agy=str(path)
+        job=self.wait(self.ws.chat({'provider':'gemini','messages':[{'role':'user','content':'hi'}]})['id'])
+        self.assertEqual(job.status,'error')
+        self.assertIn('authentication required',job.output)
 
     def test_cli_failure_shows_diagnostic(self):
         self.fake_cli("import sys\nsys.stdin.read()\nprint('Please set an Auth method')\nsys.exit(41)\n")
