@@ -22,7 +22,7 @@ class WorkspaceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name).resolve()
-        with patch('server.find_codex', return_value='fake-codex'):
+        with patch('server.find_codex', return_value='fake-codex'), patch('server.find_gemini', return_value='fake-gemini'):
             self.ws = server.Workspace(self.root)
 
     def tearDown(self):
@@ -71,15 +71,14 @@ class WorkspaceTests(unittest.TestCase):
         nodes = self.ws.team()
         for node in nodes: node['provider'] = 'gemini'
         active = 0; maximum = 0; lock = threading.Lock(); prompts = []
-        def fake(key, model, messages):
+        def fake(job, prompt, model="", key=""):
             nonlocal active, maximum
-            prompt = messages[0]['content']
             with lock:
                 active += 1; maximum = max(maximum, active); prompts.append(prompt)
             time.sleep(.08)
             with lock: active -= 1
-            return 'REPORT_OK'
-        with patch('server.gemini_request', side_effect=fake):
+            job.answer = 'REPORT_OK'
+        with patch.object(self.ws, 'gemini_process', side_effect=fake):
             job = self.wait(self.ws.run_team({'nodes': nodes, 'task': 'Build CSV app', 'key': 'test-key'})['id'])
         self.assertEqual(job.status, 'done')
         self.assertEqual(len(job.agents), 4)
@@ -91,7 +90,10 @@ class WorkspaceTests(unittest.TestCase):
     def test_team_partial_failure_is_visible(self):
         nodes = self.ws.team()[:2]
         for node in nodes: node['provider'] = 'gemini'
-        with patch('server.gemini_request', side_effect=[ValueError('quota'), 'Summary with missing report']):
+        def fake(job, prompt, model='', key=''):
+            if 'You are Архитектор' in prompt: raise ValueError('quota')
+            job.answer = 'Summary with missing report'
+        with patch.object(self.ws, 'gemini_process', side_effect=fake):
             job = self.wait(self.ws.run_team({'nodes': nodes, 'task': 'Test', 'key': 'test'})['id'])
         self.assertEqual(job.status, 'error')
         self.assertEqual(job.agents['architect']['status'], 'error')
@@ -122,54 +124,49 @@ class WorkspaceTests(unittest.TestCase):
 
 
 class GeminiTests(unittest.TestCase):
-    def tearDown(self):
-        server.gemini_ssl_context.cache_clear()
+    setUp = WorkspaceTests.setUp
+    tearDown = WorkspaceTests.tearDown
+    wait = WorkspaceTests.wait
 
-    def test_macos_roots_loaded_without_disabling_tls(self):
-        context = ssl.create_default_context()
-        with patch('server.ssl.create_default_context', return_value=context), patch('server.sys.platform', 'darwin'), patch.dict(os.environ, {}, clear=True), patch('server.subprocess.run', return_value=subprocess.CompletedProcess([], 0, stdout='PUBLIC_CERTS')) as export, patch.object(context, 'load_verify_locations') as load:
-            server.gemini_ssl_context.cache_clear()
-            self.assertIs(server.gemini_ssl_context(), context)
-            self.assertIs(server.gemini_ssl_context(), context)
-        load.assert_called_once_with(cadata='PUBLIC_CERTS')
-        export.assert_called_once()
-        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
-        self.assertTrue(context.check_hostname)
+    def fake_cli(self, code):
+        path = self.root / 'gemini'
+        path.write_text('#!' + sys.executable + '\n' + code)
+        path.chmod(0o700)
+        self.ws.gemini = str(path)
+        return path
 
-    def test_explicit_ca_file_not_overridden(self):
-        with patch('server.ssl.create_default_context') as create, patch('server.sys.platform', 'darwin'), patch.dict(os.environ, {'SSL_CERT_FILE': '/trusted/custom.pem'}), patch('server.subprocess.run') as export:
-            server.gemini_ssl_context.cache_clear()
-            self.assertIs(server.gemini_ssl_context(), create.return_value)
-            export.assert_not_called()
+    def test_cli_chat_without_api_key(self):
+        self.fake_cli("import sys,json\nassert 'plan' in sys.argv\nassert 'SECRET' not in str(sys.argv)\nassert 'Привет' in sys.stdin.read()\nprint(json.dumps({'type':'message','role':'user','content':'IGNORE'}))\nprint(json.dumps({'type':'message','role':'assistant','content':'GEMINI_'}))\nprint(json.dumps({'type':'message','role':'assistant','content':'OK'}))\n")
+        with patch.dict(os.environ, {}, clear=True):
+            job = self.wait(self.ws.chat({'provider':'gemini','messages':[{'role':'user','content':'Привет'}]})['id'])
+        self.assertEqual(job.status, 'done')
+        self.assertEqual(job.answer, 'GEMINI_OK')
 
-    def test_specific_network_errors_do_not_echo_secrets(self):
-        errors = [(ssl.SSLCertVerificationError(1, 'SECRET_KEY'), 'сертификат'),
-                  (socket.gaierror(-2, 'SECRET_KEY'), 'DNS'),
-                  (TimeoutError('SECRET_KEY'), 'ожидания'),
-                  (ConnectionRefusedError('SECRET_KEY'), 'отклонено')]
-        for reason, expected in errors:
-            with self.subTest(reason=type(reason).__name__), patch('server.gemini_ssl_context'), patch('urllib.request.urlopen', side_effect=urllib.error.URLError(reason)):
-                with self.assertRaises(ValueError) as raised:
-                    server.gemini_request('SECRET_KEY', 'gemini-3.8-flash', [])
-                self.assertIn(expected, str(raised.exception))
-                self.assertNotIn('SECRET_KEY', str(raised.exception))
+    def test_key_only_in_environment_and_redacted(self):
+        self.fake_cli("import os,sys,json\nassert 'SECRET' not in str(sys.argv)\nsys.stdin.read()\nprint(os.getenv('GEMINI_API_KEY'))\nprint(json.dumps({'type':'message','role':'assistant','content':'OK'}))\n")
+        job = self.wait(self.ws.chat({'provider':'gemini','key':'SECRET','messages':[{'role':'user','content':'hi'}]})['id'])
+        self.assertEqual(job.status, 'done')
+        self.assertNotIn('SECRET', job.output)
+        self.assertIn('[ключ скрыт]', job.output)
 
-    def test_request_format_and_response(self):
-        result = {'candidates': [{'content': {'parts': [{'text': 'hidden', 'thought': True}, {'text': 'GEMINI_OK'}]}}]}
-        with patch('server.gemini_ssl_context'), patch('urllib.request.urlopen', return_value=io.BytesIO(json.dumps(result).encode())) as opened:
-            self.assertEqual(server.gemini_request('TEST_KEY', 'gemini-3.8-flash', [{'role':'user','content':'Hi'}]), 'GEMINI_OK')
-        request = opened.call_args.args[0]
-        self.assertNotIn('TEST_KEY', request.full_url)
-        self.assertEqual(request.get_header('X-goog-api-key'), 'TEST_KEY')
-        self.assertEqual(json.loads(request.data)['contents'][0]['role'], 'user')
+    def test_cli_failure_shows_diagnostic(self):
+        self.fake_cli("import sys\nsys.stdin.read()\nprint('Please set an Auth method')\nsys.exit(41)\n")
+        job = self.wait(self.ws.chat({'provider':'gemini','messages':[{'role':'user','content':'hi'}]})['id'])
+        self.assertEqual(job.status, 'error')
+        self.assertIn('Auth method', job.output)
+        self.assertIn('консоль', job.output)
 
-    def test_error_never_echoes_key(self):
-        error = urllib.error.HTTPError('url', 403, 'SECRET_KEY', {}, io.BytesIO(b'SECRET_KEY'))
-        with patch('server.gemini_ssl_context'), patch('urllib.request.urlopen', side_effect=error):
-            with self.assertRaises(ValueError) as raised:
-                server.gemini_request('SECRET_KEY', 'gemini-3.8-flash', [])
-        self.assertNotIn('SECRET_KEY', str(raised.exception))
-        self.assertIn('403', str(raised.exception))
+    def test_gemini_cancellation(self):
+        self.fake_cli("import sys,time\nsys.stdin.read()\ntime.sleep(60)\n")
+        result = self.ws.chat({'provider':'gemini','messages':[{'role':'user','content':'hi'}]})
+        time.sleep(.1)
+        self.ws.jobs[result['id']].stop()
+        self.assertEqual(self.wait(result['id']).status, 'cancelled')
+
+    def test_missing_cli_error(self):
+        self.ws.gemini = None
+        with self.assertRaisesRegex(ValueError, 'npm install'):
+            self.ws.chat({'provider':'gemini','messages':[{'role':'user','content':'hi'}]})
 
 
 class HttpTests(unittest.TestCase):
