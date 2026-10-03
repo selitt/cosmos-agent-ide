@@ -59,6 +59,12 @@ def find_gemini() -> str | None:
     return next((c for c in candidates if c and Path(c).is_file() and os.access(c, os.X_OK)), None)
 
 
+def find_agy():
+    candidates = [os.environ.get("AGY_BINARY"), shutil.which("agy"),
+                  str(Path.home() / ".local/bin/agy"), "/usr/local/bin/agy", "/opt/homebrew/bin/agy"]
+    return next((c for c in candidates if c and Path(c).is_file() and os.access(c, os.X_OK)), None)
+
+
 class Job:
     def __init__(self, kind: str):
         self.id = secrets.token_hex(12)
@@ -110,6 +116,7 @@ class Workspace:
         self.token = secrets.token_urlsafe(32)
         self.codex = find_codex()
         self.gemini = find_gemini()
+        self.agy = find_agy()
         self.python = str(self.root / ".venv/bin/python") if (self.root / ".venv/bin/python").exists() else sys.executable
         self.jobs = {}
         self.lock = threading.RLock()
@@ -163,7 +170,7 @@ class Workspace:
         if not task or len(task) > 80_000:
             raise ValueError("Введите задачу длиной до 80 000 символов")
         key = data.get("key", "") or os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
-        if any(n["provider"] == "gemini" for n in nodes) and not self.gemini:
+        if any(n["provider"] == "gemini" for n in nodes) and not (self.agy or self.gemini):
             raise ValueError("Gemini CLI не найден. Выполните npm install -g @google/gemini-cli и перезапустите IDE.")
         if any(n["provider"] == "codex" for n in nodes) and not self.codex:
             raise ValueError("Codex CLI не найден")
@@ -279,14 +286,15 @@ class Workspace:
         threading.Thread(target=run, daemon=True).start()
         return {"id": job.id}
 
-    def process(self, job, args, prompt=None, codex=False, gemini=False, key=""):
+    def process(self, job, args, prompt=None, codex=False, gemini=False, key="", agy=False):
         env = os.environ.copy()
         # Credentials supplied for Gemini are never forwarded to Python scripts or Codex.
         env.pop("GEMINI_API_KEY", None)
         env.pop("GOOGLE_API_KEY", None)
         if gemini:
             env["PATH"] = str(Path(args[0]).parent) + os.pathsep + env.get("PATH", "")
-            if key:
+            env["TERM"] = "xterm-256color"
+            if key and not agy:
                 env["GEMINI_API_KEY"] = key
         with job.lock:
             if job.cancelled.is_set():
@@ -307,6 +315,20 @@ class Workspace:
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         job.append(line)
+                        continue
+                    if agy:
+                        if event.get("event") == "step_update":
+                            step = event.get("step_update", {})
+                            if step.get("step_type") == "agent_response":
+                                with job.lock:
+                                    job.answer += step.get("text_delta", "")
+                        elif event.get("event") == "result":
+                            result = event.get("result", {})
+                            if result.get("status") == "SUCCESS":
+                                with job.lock:
+                                    job.answer = result.get("response", job.answer)
+                            else:
+                                job.append(str(result.get("error") or result.get("status")) + "\n")
                         continue
                     if event.get("type") == "message" and event.get("role") == "assistant":
                         with job.lock:
@@ -339,6 +361,15 @@ class Workspace:
             proc.stdout.close()
 
     def gemini_process(self, job, prompt, model="", key=""):
+        if self.agy:
+            args = [self.agy, "--mode", "plan", "--input-format", "stream-json",
+                    "--output-format", "stream-json", "--print-timeout", "180s",
+                    "--model", model.strip() or "gemini-3.8-flash-medium"]
+            wire = json.dumps({"event": "user", "message": {"content": prompt}}, ensure_ascii=False) + "\n"
+            self.process(job, args, wire, gemini=True, agy=True)
+            if not job.answer.strip() and not job.cancelled.is_set():
+                raise ValueError(job.output[-2000:] or "Antigravity CLI не вернул ответ. Войдите через консоль в настройках.")
+            return
         args = [self.gemini, "--output-format", "stream-json", "--approval-mode", "plan", "--skip-trust", "-e", "none"]
         if model.strip():
             args += ["--model", model.strip()]
@@ -347,8 +378,10 @@ class Workspace:
             self.process(job, args + ["-p", "Ответь на запрос из stdin."], prompt, gemini=True, key=key)
         except ValueError:
             if "UNSUPPORTED_CLIENT" in job.output or "IneligibleTierError" in job.output:
+                with job.lock:
+                    job.output = ""
                 raise ValueError("Google отклонил вход через Gemini Code Assist для этого аккаунта (UNSUPPORTED_CLIENT). "
-                                 "В консоли Gemini выполните /auth → Use Gemini API Key, затем укажите ключ в настройках IDE. "
+                                 "Установите официальный Antigravity CLI (agy) и войдите через консоль в настройках IDE. "
                                  "Запросы продолжат выполняться через Gemini CLI.") from None
             raise
         if not job.answer.strip() and not job.cancelled.is_set():
@@ -356,12 +389,14 @@ class Workspace:
 
     def gemini_login(self):
         self.gemini = find_gemini()
-        if not self.gemini:
-            raise ValueError("Сначала установите Gemini CLI: npm install -g @google/gemini-cli")
+        self.agy = find_agy()
+        if not (self.agy or self.gemini):
+            raise ValueError("Установите Antigravity CLI: https://antigravity.google/docs/cli/install/")
         if sys.platform != "darwin":
             raise ValueError("Запустите gemini в вашем терминале и войдите в Google.")
+        binary = self.agy or self.gemini
         with tempfile.NamedTemporaryFile(mode="w", prefix="cosmos-gemini-login-", suffix=".command", delete=False) as script:
-            script.write("#!/bin/sh\nexport PATH=" + shlex.quote(str(Path(self.gemini).parent)) + ':"$PATH"\nexec ' + shlex.quote(self.gemini) + "\n")
+            script.write("#!/bin/sh\nexport PATH=" + shlex.quote(str(Path(binary).parent)) + ':"$PATH"\nexec ' + shlex.quote(binary) + "\n")
         os.chmod(script.name, 0o700)
         subprocess.run(["/usr/bin/open", "-a", "Terminal", script.name], check=True, timeout=10)
         return {"ok": True}
@@ -376,7 +411,7 @@ class Workspace:
         if sum(len(m["content"]) for m in messages) > 150_000:
             raise ValueError("Контекст слишком большой. Начните новый чат или отключите вложение файла.")
         if provider == "gemini":
-            if not self.gemini:
+            if not (self.agy or self.gemini):
                 raise ValueError("Gemini CLI не найден. Выполните npm install -g @google/gemini-cli и перезапустите IDE.")
             key = data.get("key", "") or os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
             prompt = SYSTEM + "\n\nConversation:\n" + "\n\n".join(m["role"] + ":\n" + m["content"] for m in messages)
@@ -427,7 +462,7 @@ def handler_for(ws):
             try:
                 if url.path == "/api/info":
                     result = {"root": str(ws.root), "name": ws.root.name, "python": ws.python, "codex": ws.codex,
-                              "gemini": ws.gemini, "geminiConfigured": bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))}
+                              "gemini": ws.agy or ws.gemini, "geminiBackend": "Antigravity CLI" if ws.agy else "Gemini CLI", "geminiConfigured": bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))}
                 elif url.path == "/api/tree":
                     result = ws.tree(query.get("path", [""])[0])
                 elif url.path == "/api/file":
