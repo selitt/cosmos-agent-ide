@@ -339,11 +339,18 @@ class Workspace:
             proc.stdout.close()
 
     def gemini_process(self, job, prompt, model="", key=""):
-        args = [self.gemini, "--output-format", "stream-json", "--approval-mode", "plan", "-e", "none"]
+        args = [self.gemini, "--output-format", "stream-json", "--approval-mode", "plan", "--skip-trust", "-e", "none"]
         if model.strip():
             args += ["--model", model.strip()]
         # The conversation travels through stdin, not the process list.
-        self.process(job, args + ["-p", "Ответь на запрос из stdin."], prompt, gemini=True, key=key)
+        try:
+            self.process(job, args + ["-p", "Ответь на запрос из stdin."], prompt, gemini=True, key=key)
+        except ValueError:
+            if "UNSUPPORTED_CLIENT" in job.output or "IneligibleTierError" in job.output:
+                raise ValueError("Google отклонил вход через Gemini Code Assist для этого аккаунта (UNSUPPORTED_CLIENT). "
+                                 "В консоли Gemini выполните /auth → Use Gemini API Key, затем укажите ключ в настройках IDE. "
+                                 "Запросы продолжат выполняться через Gemini CLI.") from None
+            raise
         if not job.answer.strip() and not job.cancelled.is_set():
             raise ValueError(job.output[-3000:] or "Gemini CLI не вернул ответ. Войдите через консоль в настройках.")
 
