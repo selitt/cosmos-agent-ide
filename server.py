@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.parse
 import webbrowser
+from ide_tools import Session, complete
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 WEB = Path(__file__).parent / "web"
@@ -469,6 +470,45 @@ class Workspace:
         prompt = SYSTEM + "\n\nConversation:\n" + "\n\n".join(m["role"] + ":\n" + m["content"] for m in messages)
         return self.launch("chat", lambda job: self.process(job, args, prompt, codex=True))
 
+    def start_session(self, kind, data):
+        with self.lock:
+            busy = {'run', 'debug'} if kind in {'run', 'debug'} else {kind}
+            if any(j.kind in busy and j.status == 'running' for j in self.jobs.values()):
+                raise ValueError('Сначала остановите текущий процесс')
+            if kind == 'terminal':
+                shell = os.environ.get('SHELL', '/bin/zsh')
+                session = Session(self.root, [shell, '-il'], kind, terminal=True)
+            else:
+                path = safe_path(self.root, data['path'])
+                if path.suffix != '.py' or not path.is_file():
+                    raise ValueError('Выберите сохранённый Python-файл')
+                python = data.get('python', self.python).strip() or self.python
+                args = shlex.split(data.get('args', ''))
+                if kind == 'run':
+                    session = Session(self.root, [python, '-u', str(path), *args], kind, terminal=True)
+                else:
+                    breaks = self.validate_breakpoints(data.get('breakpoints', {}))
+                    session = Session(self.root, [python, '-u', str(Path(__file__).with_name('debug_runner.py'))], kind,
+                                      initial={'root': str(self.root), 'path': str(path), 'args': args, 'breakpoints': breaks})
+            completed = [key for key, job in self.jobs.items() if job.status != 'running']
+            for key in completed[:-15]:
+                del self.jobs[key]
+            self.jobs[session.id] = session
+            return {'id': session.id}
+
+    def validate_breakpoints(self, breaks):
+        if not isinstance(breaks, dict) or len(breaks) > 100:
+            raise ValueError('Некорректные точки остановки')
+        result = {}
+        for name, lines in breaks.items():
+            path = safe_path(self.root, name)
+            if path.suffix != '.py' or not path.is_file() or not isinstance(lines, list) or len(lines) > 500:
+                raise ValueError('Некорректные точки остановки')
+            if any(type(line) is not int or not 1 <= line <= 100000 for line in lines):
+                raise ValueError('Некорректный номер строки')
+            result[str(path.relative_to(self.root))] = lines
+        return result
+
 
 def handler_for(ws):
     class Handler(BaseHTTPRequestHandler):
@@ -494,11 +534,11 @@ def handler_for(ws):
 
         def do_GET(self):
             url = urllib.parse.urlsplit(self.path)
-            if url.path in {"/", "/app.js", "/style.css"}:
+            if url.path in {"/", "/app.js", "/devtools.js", "/style.css"}:
                 if self.headers.get("Host") != f"127.0.0.1:{self.server.server_port}":
                     return self.reply({"error": "Invalid host"}, 403)
                 name = "index.html" if url.path == "/" else url.path[1:]
-                return self.reply((WEB / name).read_bytes(), mime={"index.html": "text/html", "app.js": "text/javascript", "style.css": "text/css"}[name])
+                return self.reply((WEB / name).read_bytes(), mime="text/javascript" if name.endswith('.js') else "text/css" if name.endswith('.css') else "text/html")
             if not self.authorized():
                 return self.reply({"error": "Откройте ссылку из терминала с токеном доступа"}, 403)
             query = urllib.parse.parse_qs(url.query)
@@ -539,11 +579,32 @@ def handler_for(ws):
                 elif self.path == "/api/team/run":
                     result = ws.run_team(data)
                 elif self.path == "/api/run":
-                    path = safe_path(ws.root, data["path"])
-                    if path.suffix != ".py" or not path.is_file():
-                        raise ValueError("Выберите сохранённый Python-файл")
-                    interpreter = data.get("python", ws.python).strip()
-                    result = ws.launch("run", lambda job: ws.process(job, [interpreter, "-u", str(path)]))
+                    result = ws.start_session('run', data)
+                elif self.path == '/api/terminal/start':
+                    result = ws.start_session('terminal', data)
+                elif self.path == '/api/debug/start':
+                    result = ws.start_session('debug', data)
+                elif self.path == '/api/session/input':
+                    job = ws.jobs[data['id']]
+                    if not isinstance(job, Session):
+                        raise ValueError('Этот процесс не принимает ввод')
+                    if job.kind == 'debug':
+                        job.send({'action': 'input', 'text': data['text']})
+                    else:
+                        job.send(data['text'])
+                    result = {'ok': True}
+                elif self.path == '/api/debug/action':
+                    job = ws.jobs[data['id']]
+                    action = data['action']
+                    if not isinstance(job, Session) or job.kind != 'debug' or action not in {'step', 'next', 'out', 'continue', 'pause', 'breakpoints'}:
+                        raise ValueError('Некорректная команда отладки')
+                    command = {'action': action}
+                    if action == 'breakpoints':
+                        command['breakpoints'] = ws.validate_breakpoints(data['breakpoints'])
+                    job.send(command)
+                    result = {'ok': True}
+                elif self.path == '/api/completion':
+                    result = complete(data['source'], data['offset'])
                 elif self.path == "/api/gemini/login":
                     result = ws.gemini_login()
                 elif self.path == "/api/chat":
