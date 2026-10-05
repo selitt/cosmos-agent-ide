@@ -150,7 +150,7 @@ class GeminiTests(unittest.TestCase):
         self.assertIn('[ключ скрыт]', job.output)
 
     def test_antigravity_console_protocol_and_final_response(self):
-        path=self.fake_cli("import sys,json,os\nassert 'plan' in sys.argv\nassert '--dangerously-skip-permissions' not in sys.argv\nassert 'gemini-3.8-flash-medium' in sys.argv\nassert 'GEMINI_API_KEY' not in os.environ\nm=json.loads(sys.stdin.readline())\nassert m['event']=='user'\nassert 'Привет' in m['message']['content']\nprint(json.dumps({'event':'step_update','step_update':{'step_type':'agent_response','text_delta':'partial'}}))\nprint(json.dumps({'event':'result','result':{'status':'SUCCESS','response':'AGY_OK'}}))\n")
+        path=self.fake_cli("import sys,json,os\nassert 'plan' in sys.argv\nassert '--agent' in sys.argv and 'cosmos-ide-review' in sys.argv\nassert '--dangerously-skip-permissions' not in sys.argv\nassert 'gemini-3.8-flash-medium' in sys.argv\nassert 'GEMINI_API_KEY' not in os.environ\nm=json.loads(sys.stdin.readline())\nassert m['event']=='user'\nassert 'Привет' in m['message']['content']\nprint(json.dumps({'event':'step_update','step_update':{'step_type':'agent_response','text_delta':'partial'}}))\nprint(json.dumps({'event':'result','result':{'status':'SUCCESS','response':'AGY_OK'}}))\n")
         self.ws.agy=str(path)
         job=self.wait(self.ws.chat({'provider':'gemini','key':'SECRET','messages':[{'role':'user','content':'Привет'}]})['id'])
         self.assertEqual(job.status,'done')
@@ -162,6 +162,36 @@ class GeminiTests(unittest.TestCase):
         job=self.wait(self.ws.chat({'provider':'gemini','messages':[{'role':'user','content':'hi'}]})['id'])
         self.assertEqual(job.status,'error')
         self.assertIn('authentication required',job.output)
+
+    def test_antigravity_profile_restricts_tools_and_preserves_custom_files(self):
+        self.ws.prepare_gemini_agent()
+        path = self.root / '.agents/agents/cosmos-ide-review.md'
+        spec = path.read_text()
+        self.assertIn('  - view_file', spec)
+        self.assertIn('  - grep_search', spec)
+        self.assertNotIn('  - run_command', spec)
+        self.assertIn('commandExecutionPolicy: off', spec)
+        self.ws.prepare_gemini_agent()
+        path.write_text('user customization')
+        with self.assertRaises(ValueError):
+            self.ws.prepare_gemini_agent()
+        self.assertEqual(path.read_text(), 'user customization')
+
+    def test_antigravity_profile_cannot_escape_workspace(self):
+        with tempfile.TemporaryDirectory() as outside:
+            (self.root / '.agents').symlink_to(outside)
+            with self.assertRaises(ValueError):
+                self.ws.prepare_gemini_agent()
+            self.assertFalse(list(Path(outside).iterdir()))
+
+    def test_antigravity_command_denial_does_not_suggest_login_or_duplicate_error(self):
+        path = self.fake_cli("import sys\nsys.stdin.read()\nprint('jetski: no output produced — headless mode cannot prompt, auto-denied')\nsys.exit(1)\n")
+        self.ws.agy = str(path)
+        job = self.wait(self.ws.chat({'provider':'gemini','messages':[{'role':'user','content':'hi'}]})['id'])
+        self.assertEqual(job.status, 'error')
+        self.assertEqual(job.output.count('Gemini запросил инструмент'), 1)
+        self.assertIn('Повторный Google-вход не требуется', job.output)
+        self.assertNotIn('jetski', job.output)
 
     def test_cli_failure_shows_diagnostic(self):
         self.fake_cli("import sys\nsys.stdin.read()\nprint('Please set an Auth method')\nsys.exit(41)\n")
