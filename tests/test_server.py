@@ -223,6 +223,11 @@ class HttpTests(unittest.TestCase):
             try:
                 with self.assertRaises(urllib.error.HTTPError) as error: urllib.request.urlopen(base+'/api/info')
                 self.assertEqual(error.exception.code,403)
+                for route in ['/api/terminal/start', '/api/debug/start', '/api/session/input']:
+                    request = urllib.request.Request(base+route, data=b'{}', headers={'Content-Type':'application/json'})
+                    with self.assertRaises(urllib.error.HTTPError) as denied:
+                        urllib.request.urlopen(request)
+                    self.assertEqual(denied.exception.code, 403)
                 request = urllib.request.Request(base+'/api/info',headers={'X-IDE-Token':ws.token,'Origin':'https://evil.example'})
                 with self.assertRaises(urllib.error.HTTPError) as error: urllib.request.urlopen(request)
                 self.assertEqual(error.exception.code,403)
