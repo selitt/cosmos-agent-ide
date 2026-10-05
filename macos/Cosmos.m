@@ -46,7 +46,7 @@
     if (last && [[NSFileManager defaultManager] fileExistsAtPath:last]) [self startServer:last];
     else [self chooseFolder:nil];
 }
-- (void)about:(id)sender { [self showMessage:@"Cosmos Agent IDE 0.1.4\nPython + Codex + Gemini\nКоманда AI-агентов в одном пространстве."]; }
+- (void)about:(id)sender { [self showMessage:@"Cosmos Agent IDE 0.2.0\nPython + Codex + Gemini\nКоманда AI-агентов в одном пространстве."]; }
 - (void)showMessage:(NSString *)message { NSAlert *alert = [NSAlert new]; alert.messageText = @"Cosmos"; alert.informativeText = message; [alert runModal]; }
 - (void)chooseFolder:(id)sender {
     if (self.server) {
